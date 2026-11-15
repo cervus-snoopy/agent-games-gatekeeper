@@ -49,3 +49,7 @@ module.exports = async (req, res) => {
     try { res.status(500).json({ error: 'internal error' }); } catch (_) { /* gone */ }
   }
 };
+
+// Vercel: disable the default JSON body parser so the raw request body
+// stays available for HMAC verification (see lib/gatekeeper-core.js).
+module.exports.config = { api: { bodyParser: false } };
