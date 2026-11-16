@@ -18,6 +18,14 @@
  *   - 60s hard deadline per task. Proof generation is time-boxed; if it
  *     cannot finish in budget, the decision is returned WITHOUT a proof
  *     (omitted proof costs -2, a timeout costs -2 and forfeits the task).
+ *   - Kurier on-chain submission (optional, env KURIER_API_KEY): after a
+ *     proof is generated, it is POSTed to Kurier and polled until
+ *     Finalized; the returned txHash replaces proof_tx in the response.
+ *     The platform only counts a proof as verified once it is on-chain
+ *     and Finalized (per the /build docs). Any Kurier failure, timeout,
+ *     or missing key leaves the response exactly as before (decision +
+ *     local proof, original proof_tx) — Kurier never throws and never
+ *     pushes the answer past the 60s deadline.
  *
  * Proof generation (snarkjs, local, Groth16/BN128, Circom 2.x):
  *   Circuit inputs were recovered from circuits/gatekeeper.wasm by
@@ -98,6 +106,12 @@ const PROOF_MODE = (process.env.PROOF_MODE || 'prove').toLowerCase();
 const PROOF_BUDGET_MS = parseInt(process.env.PROOF_BUDGET_MS || '45000', 10);
 const TASK_DEADLINE_MS = 60_000;
 
+// Kurier on-chain proof submission (optional). Absent KURIER_API_KEY =
+// feature off (current behavior: decision + local proof only).
+const KURIER_API_KEY = process.env.KURIER_API_KEY || '';
+const KURIER_BASE = (process.env.KURIER_BASE || 'https://api.kurier.xyz/api/v1').replace(/\/+$/, '');
+const KURIER_POLL_BUDGET_MS = parseInt(process.env.KURIER_POLL_BUDGET_MS || '40000', 10);
+
 const WASM_PATH = path.join(__dirname, 'circuits', 'gatekeeper.wasm');
 const ZKEY_PATH = path.join(__dirname, 'circuits', 'gatekeeper_final.zkey');
 const SEEN_FILE = process.env.SEEN_FILE || path.join(__dirname, 'data', 'seen-proof-tx.json');
@@ -139,6 +153,61 @@ function persistSeen() {
   }
 }
 loadSeen();
+
+// ------------------------------------------- persistent seen-set (Redis) --
+// Optional durable backend for the seen proof_tx set, via Upstash REST
+// (no new dependency — plain global fetch). Enabled only when BOTH
+// UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN are set.
+//   - Redis key: `seen-proof-tx` (a SET).
+//   - Reuse check: SISMEMBER before deciding (Redis is source of truth).
+//   - Record: SADD right after every decision (APPROVE or REJECT).
+// The /tmp file + in-memory Set stay as a local cache and as the fallback:
+// if Redis is unset or a request fails/times out (2s), the task proceeds
+// on the local set and only a warning is logged — a Redis outage must
+// never fail a task (the decision matters more than the reuse record).
+const REDIS_URL = (process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/+$/, '');
+const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
+const REDIS_ENABLED = Boolean(REDIS_URL && REDIS_TOKEN);
+const REDIS_KEY = 'seen-proof-tx';
+const REDIS_TIMEOUT_MS = 2000;
+
+async function redisCall(command, member) {
+  const res = await fetch(REDIS_URL, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${REDIS_TOKEN}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify([command, REDIS_KEY, member]),
+    signal: AbortSignal.timeout(REDIS_TIMEOUT_MS),
+  });
+  if (!res.ok) throw new Error(`Redis HTTP ${res.status}`);
+  const body = await res.json();
+  if (body && body.error) throw new Error(`Redis error: ${body.error}`);
+  return body.result;
+}
+
+async function redisIsMember(proofTx) {
+  // true / false, or null when Redis is disabled/unavailable (caller then
+  // falls back to the local seen-set — never fail the task over this).
+  if (!REDIS_ENABLED) return null;
+  try {
+    const result = await redisCall('SISMEMBER', proofTx);
+    return result === 1 || result === '1';
+  } catch (e) {
+    console.warn('[gatekeeper] WARN: Redis SISMEMBER failed, using local seen-set:', e.message);
+    return null;
+  }
+}
+
+async function redisAdd(proofTx) {
+  if (!REDIS_ENABLED) return;
+  try {
+    await redisCall('SADD', proofTx);
+  } catch (e) {
+    console.warn('[gatekeeper] WARN: Redis SADD failed, proof_tx recorded locally only:', e.message);
+  }
+}
 
 // ------------------------------------------------------------ HMAC utils --
 function hmacHex(secret, bodyBuffer) {
@@ -199,8 +268,9 @@ function parseAddress(value, field) {
  * Returns { decision: 'APPROVE'|'REJECT', reason_code, input: <parsed numbers> }.
  * reason_code is 'VALID_CONDITION' on APPROVE; on REJECT it names the first failed check.
  * Throws on malformed envelopes (caller maps that to a REJECT).
+ * Async: the PROOF_REUSED check may query Redis (2s timeout, local fallback).
  */
-function evaluateTask(env) {
+async function evaluateTask(env) {
   if (!env || typeof env !== 'object') throw new Error('envelope is not an object');
   const input = env.input;
   if (!input || typeof input !== 'object') throw new Error('missing input');
@@ -254,7 +324,10 @@ function evaluateTask(env) {
   if (currentBlock >= expiryBlock) {
     return { decision: 'REJECT', reason_code: REASONS.EXPIRED_CONDITION, input: parsed };
   }
-  if (seenProofTx.has(proofTx)) {
+  // Reuse check: local memory/file set first (fast), then Redis — the
+  // durable source of truth. A Redis hit rejects even if the local cache
+  // (which a Vercel cold start can wipe) has never seen this proof_tx.
+  if (seenProofTx.has(proofTx) || (await redisIsMember(proofTx))) {
     return { decision: 'REJECT', reason_code: REASONS.PROOF_REUSED, input: parsed };
   }
 
@@ -323,6 +396,144 @@ function withTimeout(promise, ms, label) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
+// ------------------------------------------------------- Kurier (on-chain) --
+// The platform counts a proof as verified ONLY once it is submitted
+// on-chain (Kurier or zkVerifyJS) and reaches Finalized. After a proof is
+// generated locally, it is submitted to Kurier and polled until Finalized;
+// the returned txHash then replaces proof_tx in the response. Best effort
+// only: any Kurier failure, timeout, or missing key leaves the response
+// exactly as before (decision + local proof, original proof_tx). Kurier
+// never throws and never pushes the answer past the 60s deadline.
+
+// Full verification key, exported ONCE at startup (only when prove mode +
+// a Kurier key are set) and cached in memory — used for the
+// vkRegistered:false fallback. Never hardcoded.
+let fullVkPromise = null;
+function initFullVk() {
+  if (PROOF_MODE !== 'prove' || !KURIER_API_KEY) return;
+  if (fullVkPromise) return;
+  fullVkPromise = (async () => {
+    try {
+      const snarkjs = await getSnarkjs();
+      return await snarkjs.zKey.exportVerificationKey(ZKEY_PATH);
+    } catch (e) {
+      console.warn('[gatekeeper] WARN: could not export full verification key for Kurier fallback:', e.message);
+      return null;
+    }
+  })();
+}
+async function getFullVk() {
+  return fullVkPromise ? await fullVkPromise : null;
+}
+initFullVk();
+
+async function fetchJson(url, opts, timeoutMs) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), Math.max(1, timeoutMs));
+  try {
+    const res = await fetch(url, { ...opts, signal: ctrl.signal });
+    const text = await res.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch (_) { /* non-JSON body */ }
+    return { status: res.status, ok: res.ok, json, text };
+  } finally { clearTimeout(t); }
+}
+
+function kurierStatusOf(resp) {
+  if (!resp) return 'UNKNOWN';
+  const j = resp.json;
+  if (typeof j === 'string') return j;
+  if (j && typeof j === 'object') {
+    for (const k of ['status', 'state', 'result']) {
+      if (typeof j[k] === 'string') return j[k];
+    }
+    if (j.job && typeof j.job.status === 'string') return j.job.status;
+  }
+  return 'UNKNOWN';
+}
+
+function kurierTxHashOf(resp) {
+  if (!resp || !resp.json || typeof resp.json !== 'object') return null;
+  const j = resp.json;
+  return j.txHash || j.tx_hash || j.transactionHash || (j.job && j.job.txHash) || null;
+}
+
+/**
+ * Submit a proof to Kurier and poll until Finalized/Failed or the budget
+ * runs out. Returns { jobId, status, txHash, ms }. NEVER throws.
+ * Attempt 1: vkRegistered:true + vkHash. If that submit fails (non-OK or
+ * no jobId), attempt 2: vkRegistered:false + the full verification key.
+ * Per-fetch timeouts are capped by the remaining budget, so total Kurier
+ * time can never exceed budgetMs.
+ */
+async function kurierSubmitAndPoll(proof, publicSignals, registeredVkHex, budgetMs, fullVk) {
+  const t0 = Date.now();
+  const remaining = () => budgetMs - (Date.now() - t0);
+  const attempts = [
+    { vkRegistered: true, vk: registeredVkHex, label: 'vkHash' },
+    { vkRegistered: false, vk: fullVk, label: 'fullVk' },
+  ];
+  try {
+    for (const att of attempts) {
+      if (att.vk === null || att.vk === undefined) {
+        console.warn(`[gatekeeper] kurier: skipping ${att.label} attempt (no verification key available)`);
+        continue;
+      }
+      if (remaining() <= 1000) break;
+      let submit;
+      try {
+        submit = await fetchJson(
+          `${KURIER_BASE}/submit-proof/${KURIER_API_KEY}`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              proofType: 'groth16',
+              vkRegistered: att.vkRegistered,
+              proofOptions: { library: 'snarkjs', curve: 'bn128' },
+              proofData: { proof, publicSignals, vk: att.vk },
+            }),
+          },
+          Math.min(15000, remaining()),
+        );
+      } catch (e) {
+        console.warn(`[gatekeeper] kurier submit failed (${att.label}): ${e.message}`);
+        continue; // try the next attempt (fullVk fallback)
+      }
+      if (!submit.ok) {
+        console.warn(`[gatekeeper] kurier submit failed (${att.label}): HTTP ${submit.status} ${(submit.text || '').slice(0, 200)}`);
+        continue; // try the next attempt (fullVk fallback)
+      }
+      const jobId = submit.json && (submit.json.jobId || submit.json.job_id || submit.json.id || (submit.json.job && submit.json.job.id));
+      if (!jobId) {
+        console.warn(`[gatekeeper] kurier submit: no jobId in response (${att.label})`);
+        return { jobId: null, status: 'NO_JOB_ID', txHash: null, ms: Date.now() - t0 };
+      }
+      // Poll until Finalized / Failed / budget.
+      let status = 'UNKNOWN';
+      let txHash = null;
+      while (remaining() > 1000) {
+        let st;
+        try {
+          st = await fetchJson(`${KURIER_BASE}/job-status/${KURIER_API_KEY}/${jobId}`, {}, Math.min(10000, remaining()));
+        } catch (e) {
+          console.warn(`[gatekeeper] kurier job-status failed: ${e.message}`);
+          break;
+        }
+        status = kurierStatusOf(st);
+        txHash = kurierTxHashOf(st);
+        if (/final/i.test(status) || /fail/i.test(status)) break;
+        await new Promise((r) => setTimeout(r, Math.min(3000, remaining())));
+      }
+      return { jobId: String(jobId), status, txHash, ms: Date.now() - t0 };
+    }
+    return { jobId: null, status: 'SUBMIT_FAILED', txHash: null, ms: Date.now() - t0 };
+  } catch (e) {
+    console.warn(`[gatekeeper] kurier error: ${e.message}`);
+    return { jobId: null, status: 'ERROR', txHash: null, ms: Date.now() - t0 };
+  }
+}
+
 // ------------------------------------------------------------ HTTP layer --
 function sendJson(res, status, obj, sign = true) {
   const body = Buffer.from(JSON.stringify(obj), 'utf8');
@@ -378,7 +589,7 @@ async function handleAgent(req, res, rawBody) {
 
   let evalResult;
   try {
-    evalResult = evaluateTask(env);
+    evalResult = await evaluateTask(env);
   } catch (e) {
     // Malformed envelope: fail closed. The spec's example reject uses
     // VK_SUBSTITUTION; use it as the generic malformed-envelope code
@@ -390,9 +601,12 @@ async function handleAgent(req, res, rawBody) {
   const { decision, reason_code, input } = evalResult;
 
   // Record the proof_tx as seen (any decision) so a later reuse is a trap.
+  // Local file first (cache), then Redis (durable). A Redis failure only
+  // warns — the decision stands either way.
   if (input && input.proofTx) {
     seenProofTx.add(input.proofTx);
     persistSeen();
+    await redisAdd(input.proofTx);
   }
 
   const response = { decision, reason_code, proof_tx: (input && input.proofTx) || String((env.input && env.input.proof_tx) || '') };
@@ -431,6 +645,30 @@ async function handleAgent(req, res, rawBody) {
     console.log(`[gatekeeper] task ${taskId}: ${decision} (${reason_code}) [proof ${why}], ${Date.now() - startedAt}ms`);
   }
 
+  // 6. Kurier: submit the proof on-chain and wait for Finalized (best
+  // effort, strictly inside the 60s deadline). On Finalized with a
+  // txHash, the on-chain tx hash replaces proof_tx in the response —
+  // that is what the platform counts as a verified proof. Any failure
+  // leaves the response exactly as it was (decision + local proof).
+  if (KURIER_API_KEY && response.proof) {
+    const kurierBudget = Math.min(
+      KURIER_POLL_BUDGET_MS,
+      TASK_DEADLINE_MS - (Date.now() - startedAt) - 2000,
+    );
+    if (kurierBudget > 5000) {
+      const fullVk = await getFullVk();
+      const kurier = await kurierSubmitAndPoll(
+        response.proof, response.public_signals, input.registeredVk, kurierBudget, fullVk);
+      console.log(`[gatekeeper] task ${taskId}: kurier ${kurier.status} job=${kurier.jobId || '-'} ${kurier.ms}ms`);
+      if (/final/i.test(kurier.status) && kurier.txHash) {
+        response.proof_tx = kurier.txHash;
+        console.log(`[gatekeeper] task ${taskId}: proof_tx replaced with on-chain txHash ${kurier.txHash}`);
+      }
+    } else {
+      console.log(`[gatekeeper] task ${taskId}: kurier skipped (budget ${kurierBudget}ms too small)`);
+    }
+  }
+
   return sendJson(res, 200, response);
 }
 
@@ -453,5 +691,5 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`[gatekeeper] listening on 0.0.0.0:${PORT} /agent (proof mode: ${PROOF_MODE}, ` +
-    `proof budget: ${PROOF_BUDGET_MS}ms, seen proof_tx: ${seenProofTx.size})`);
+    `proof budget: ${PROOF_BUDGET_MS}ms, kurier: ${KURIER_API_KEY ? 'configured' : 'not configured'}, seen proof_tx: ${seenProofTx.size}, redis: ${REDIS_ENABLED ? 'on' : 'off'})`);
 });
