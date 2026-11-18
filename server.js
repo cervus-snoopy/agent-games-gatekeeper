@@ -65,11 +65,12 @@
  *     - integer fields: BigInt(decimal string).
  *     - decision: "1" = APPROVE, "0" = REJECT.
  *     - registeredVkHash / proofVkHash: BigInt(hex) mod FIELD_PRIME.
- *     - taskId: sha256(utf8(task_id)) mod FIELD_PRIME — CHANGED 18 Nov 2026
- *       from keccak256 (experiment: every correct task scored +10 with a
- *       platform proof_failure; the reference implementation defaults to
- *       sha256). If R07 still scores +10, try the next candidate
- *       (BigInt of the task UUID hex, the platform's Steal idiom).
+ *     - taskId: BigInt of the task UUID hex (dashes stripped) — CHANGED
+ *       18 Nov 2026 (candidate #2). Candidate #1 sha256 was DISPROVEN live:
+ *       R06 task 2 (19:54 WIB) scored +10 again with proof_failure, same as
+ *       keccak256 before it. Non-UUID task ids fall back to sha256. If this
+ *       also scores +10, the encoding is not the taskId at all — re-check
+ *       the salt/commitment or the proof_tx binding instead.
  *     - salt: keccak256("salt:" + task_id) mod FIELD_PRIME (deterministic
  *       per task, so a retry produces the same proof inputs).
  *   If the platform rejects proofs with a public-signals mismatch, the
@@ -354,6 +355,19 @@ function sha256Hex(str) {
   // hex string without 0x throws (BigInt("ab12...") is invalid).
   return '0x' + crypto.createHash('sha256').update(str, 'utf8').digest('hex');
 }
+// EXPERIMENT 18 Nov 2026 (Ady order, candidate #2): taskId encoding.
+// Candidate #1 (sha256 of the full task_id) was DISPROVEN live 19:54 WIB —
+// R06 task 2 scored +10 again with proof_failure. Candidate #2: the task
+// UUID as a field element — BigInt of the UUID hex (dashes stripped). A UUID
+// is 128 bits, FIELD_P is ~254 bits, so it always fits exactly (no mod wrap).
+// This mirrors how the Steal circuit treats matchId (bytes32). Non-UUID task
+// ids (practice/probe ids) fall back to sha256 so harness + probes keep working.
+const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+function taskIdField(taskId) {
+  const m = String(taskId).match(UUID_RE);
+  if (m) return '0x' + m[0].replace(/-/g, '');
+  return sha256Hex(taskId);
+}
 let ethersKeccak = null;
 function keccak256Hex(str) {
   if (!ethersKeccak) ethersKeccak = require('ethers').keccak256;
@@ -380,12 +394,12 @@ function buildCircuitInput(parsed, decision) {
     decision: decision === 'APPROVE' ? '1' : '0',
     registeredVkHash: field(parsed.registeredVk),
     proofVkHash: field(parsed.proofVk),
-    // EXPERIMENT 18 Nov 2026 (Ady order): taskId was keccak256(utf8(task_id))
-    // and every correct task scored +10 (platform proof_failure, 0 verified).
-    // Switched to sha256 — the reference implementation's default — to test
-    // whether the platform's expected encoding is sha256. Salt UNCHANGED
-    // (still keccak256("salt:"+task_id)) so the experiment changes ONE variable.
-    taskId: field(sha256Hex(parsed.taskId)),
+    // EXPERIMENT 18 Nov 2026 (Ady order, candidate #2): taskId = BigInt of
+    // the task UUID hex (dashes stripped); falls back to sha256 for
+    // non-UUID ids. Candidate #1 sha256 was disproven live (R06 task 2,
+    // 19:54 WIB, +10 again). Salt UNCHANGED (still keccak256("salt:"+task_id))
+    // so the experiment changes ONE variable.
+    taskId: field(taskIdField(parsed.taskId)),
     salt: field(keccak256Hex(`salt:${parsed.taskId}`)),
   };
 }
