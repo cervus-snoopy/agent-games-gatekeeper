@@ -65,7 +65,11 @@
  *     - integer fields: BigInt(decimal string).
  *     - decision: "1" = APPROVE, "0" = REJECT.
  *     - registeredVkHash / proofVkHash: BigInt(hex) mod FIELD_PRIME.
- *     - taskId: keccak256(utf8(task_id)) mod FIELD_PRIME.
+ *     - taskId: sha256(utf8(task_id)) mod FIELD_PRIME — CHANGED 18 Nov 2026
+ *       from keccak256 (experiment: every correct task scored +10 with a
+ *       platform proof_failure; the reference implementation defaults to
+ *       sha256). If R07 still scores +10, try the next candidate
+ *       (BigInt of the task UUID hex, the platform's Steal idiom).
  *     - salt: keccak256("salt:" + task_id) mod FIELD_PRIME (deterministic
  *       per task, so a retry produces the same proof inputs).
  *   If the platform rejects proofs with a public-signals mismatch, the
@@ -343,6 +347,13 @@ async function evaluateTask(env) {
 }
 
 // ------------------------------------------------------- proof building --
+// sha256 (Node built-in crypto) — used for taskId since the 18 Nov 2026
+// sha256 experiment (see header). keccak256Hex stays for the salt.
+function sha256Hex(str) {
+  // NOTE: must keep the 0x prefix — field() does BigInt(hex), and a bare
+  // hex string without 0x throws (BigInt("ab12...") is invalid).
+  return '0x' + crypto.createHash('sha256').update(str, 'utf8').digest('hex');
+}
 let ethersKeccak = null;
 function keccak256Hex(str) {
   if (!ethersKeccak) ethersKeccak = require('ethers').keccak256;
@@ -369,7 +380,12 @@ function buildCircuitInput(parsed, decision) {
     decision: decision === 'APPROVE' ? '1' : '0',
     registeredVkHash: field(parsed.registeredVk),
     proofVkHash: field(parsed.proofVk),
-    taskId: field(keccak256Hex(parsed.taskId)),
+    // EXPERIMENT 18 Nov 2026 (Ady order): taskId was keccak256(utf8(task_id))
+    // and every correct task scored +10 (platform proof_failure, 0 verified).
+    // Switched to sha256 — the reference implementation's default — to test
+    // whether the platform's expected encoding is sha256. Salt UNCHANGED
+    // (still keccak256("salt:"+task_id)) so the experiment changes ONE variable.
+    taskId: field(sha256Hex(parsed.taskId)),
     salt: field(keccak256Hex(`salt:${parsed.taskId}`)),
   };
 }
